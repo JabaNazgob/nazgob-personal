@@ -1,0 +1,37 @@
+{
+  "id": "nazgob-personal",
+  "title": "Nazgob Personal",
+  "description": "Личные автоматизации Foundry VTT: верховой бой, Медальон затягивающихся ран и связанные механики.",
+  "version": "0.1.11",
+  "authors": [
+    {
+      "name": "Nazgob"
+    }
+  ],
+  "compatibility": {
+    "minimum": "13.351",
+    "verified": "13.351",
+    "maximum": "13"
+  },
+  "relationships": {
+    "systems": [
+      {
+        "id": "dnd5e",
+        "type": "system",
+        "compatibility": {
+          "minimum": "5.2.5",
+          "verified": "5.2.5"
+        }
+      }
+    ],
+    "requires": [
+      {
+        "id": "midi-qol",
+        "type": "module"
+      }
+    ]
+  },
+  "esmodules": [
+    "scripts/mounted-combat.js"
+  ]
+}
