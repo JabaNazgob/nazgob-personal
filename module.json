@@ -1,8 +1,8 @@
 {
   "id": "nazgob-personal",
   "title": "Nazgob Personal",
-  "description": "Личные автоматизации Foundry VTT: верховой бой, Медальон затягивающихся ран и связанные механики.",
-  "version": "0.1.11",
+  "description": "Личные автоматизации Foundry VTT: верховой бой, верховое оружие, Медальон затягивающихся ран и связанные механики.",
+  "version": "0.1.13",
   "authors": [
     {
       "name": "Nazgob"

@@ -2120,6 +2120,309 @@ function handleDeleteToken(document, _options, userId) {
     .catch(err => error("Ошибка аварийного разъединения верховой пары", err));
 }
 
+
+// ---------------------------------------------------------------------------
+// Mounted weapon properties: "Верховой бой" and "Наскок"
+// ---------------------------------------------------------------------------
+
+export const MOUNTED_WEAPON_CONFIG = Object.freeze([
+  Object.freeze({ prefix: "Молот всадника", mountedBonus: 2, charge: "2d2" }),
+  Object.freeze({ prefix: "Кавалерийская пика", mountedBonus: 2, charge: "3d2" })
+]);
+
+const mountedWeaponMovementByActor = new Map();
+const mountedWeaponChargeUsedByActor = new Map();
+const mountedWeaponProcessedWorkflows = new WeakSet();
+
+export function mountedWeaponProfile(itemName) {
+  const name = String(itemName ?? "");
+  const profile = MOUNTED_WEAPON_CONFIG.find(entry => name.startsWith(entry.prefix));
+  return profile ? { ...profile } : null;
+}
+
+export function shouldGrantMountedWeaponBonus({ physicallyMounted, mountSize, targetSize }) {
+  if (!physicallyMounted) return false;
+  const mountRank = sizeRank(mountSize);
+  const targetRank = sizeRank(targetSize);
+  return mountRank >= 0 && targetRank >= 0 && targetRank < mountRank;
+}
+
+export function combatTurnKey(combat) {
+  if (!combat || combat.started === false || combat.round == null || combat.turn == null) return null;
+  const round = Number(combat.round);
+  const turn = Number(combat.turn);
+  if (!combat.id || !Number.isInteger(round) || round < 1 || !Number.isInteger(turn) || turn < 0) return null;
+  return `${combat.id}:${round}:${turn}`;
+}
+
+function pointXY(point) {
+  if (!point) return null;
+  const x = Number(point.x);
+  const y = Number(point.y);
+  return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+}
+
+function pointsEqual(a, b, tolerance = 0.01) {
+  return Boolean(a && b)
+    && Math.abs(Number(a.x) - Number(b.x)) <= tolerance
+    && Math.abs(Number(a.y) - Number(b.y)) <= tolerance;
+}
+
+function segmentVector(segment) {
+  if (!segment?.start || !segment?.end) return { x: 0, y: 0 };
+  return {
+    x: Number(segment.end.x) - Number(segment.start.x),
+    y: Number(segment.end.y) - Number(segment.start.y)
+  };
+}
+
+function sameForwardDirection(a, b) {
+  const va = segmentVector(a);
+  const vb = segmentVector(b);
+  const la = Math.hypot(va.x, va.y);
+  const lb = Math.hypot(vb.x, vb.y);
+  if (la <= 0.001 || lb <= 0.001) return false;
+  const cross = Math.abs((va.x * vb.y) - (va.y * vb.x));
+  const tolerance = Math.max(0.01, la * lb * 1e-6);
+  const dot = (va.x * vb.x) + (va.y * vb.y);
+  return cross <= tolerance && dot > 0;
+}
+
+export function lastStraightSegment(points = []) {
+  const clean = [];
+  for (const raw of points) {
+    const point = pointXY(raw);
+    if (!point || pointsEqual(clean.at(-1), point)) continue;
+    clean.push(point);
+  }
+  if (clean.length < 2) return null;
+
+  let startIndex = clean.length - 2;
+  const last = { start: clean.at(-2), end: clean.at(-1) };
+  for (let index = clean.length - 3; index >= 0; index -= 1) {
+    const previous = { start: clean[index], end: clean[index + 1] };
+    if (!sameForwardDirection(previous, last)) break;
+    startIndex = index;
+  }
+  return { start: clean[startIndex], end: clean.at(-1) };
+}
+
+export function mergeStraightSegments(previous, next) {
+  if (!next) return previous ?? null;
+  if (!previous) return next;
+  if (!pointsEqual(previous.end, next.start) || !sameForwardDirection(previous, next)) return next;
+  return { start: previous.start, end: next.end };
+}
+
+function pointDistance(a, b) {
+  return Math.hypot(Number(a?.x) - Number(b?.x), Number(a?.y) - Number(b?.y));
+}
+
+export function segmentMovesTowardTarget(segment, targetPoint) {
+  if (!segment?.start || !segment?.end || !targetPoint) return false;
+  return pointDistance(segment.end, targetPoint) + 0.01 < pointDistance(segment.start, targetPoint);
+}
+
+export function planMountedWeaponDamage({
+  itemName,
+  actionType,
+  physicallyMounted,
+  mountSize,
+  targetSize,
+  inCombat,
+  chargeUsed,
+  chargeDistance,
+  movedTowardTarget
+}) {
+  const profile = mountedWeaponProfile(itemName);
+  if (!profile || String(actionType ?? "").toLowerCase() !== "mwak") {
+    return { formula: null, mountedBonus: 0, chargeFormula: null, consumeCharge: false };
+  }
+
+  const mountedBonus = shouldGrantMountedWeaponBonus({ physicallyMounted, mountSize, targetSize })
+    ? profile.mountedBonus
+    : 0;
+  const chargeFormula = inCombat
+    && !chargeUsed
+    && Number(chargeDistance) >= 10
+    && movedTowardTarget
+    ? profile.charge
+    : null;
+  const parts = [];
+  if (mountedBonus) parts.push(String(mountedBonus));
+  if (chargeFormula) parts.push(chargeFormula);
+  return {
+    formula: parts.length ? parts.join(" + ") : null,
+    mountedBonus,
+    chargeFormula,
+    consumeCharge: Boolean(chargeFormula)
+  };
+}
+
+function movementPointToCenter(point, tokenDoc) {
+  const gridSize = globalThis.canvas?.grid?.size ?? globalThis.canvas?.dimensions?.size ?? 100;
+  const xy = pointXY(point);
+  if (!xy) return null;
+  const width = Number(point?.width ?? tokenDoc?.width) || 1;
+  const height = Number(point?.height ?? tokenDoc?.height) || 1;
+  return {
+    x: xy.x + ((width * gridSize) / 2),
+    y: xy.y + ((height * gridSize) / 2)
+  };
+}
+
+function movementStraightSegment(document, movement) {
+  const rawPoints = [movement?.origin, ...(movement?.passed?.waypoints ?? []), movement?.destination];
+  const centers = rawPoints.map(point => movementPointToCenter(point, document)).filter(Boolean);
+  return lastStraightSegment(centers);
+}
+
+function measureStraightSegmentDistance(segment, scene = globalThis.canvas?.scene) {
+  if (!segment) return 0;
+  try {
+    const measured = scene?.grid?.measurePath?.([segment.start, segment.end]);
+    const distance = Number(measured?.distance);
+    if (Number.isFinite(distance)) return Math.max(0, distance);
+  } catch (err) {
+    console.warn(`[${MODULE_ID}] Не удалось измерить прямой отрезок Наскока через grid.measurePath`, err);
+  }
+  const gridSize = Number(globalThis.canvas?.grid?.size ?? globalThis.canvas?.dimensions?.size) || 100;
+  const gridDistance = Number(scene?.grid?.distance ?? globalThis.canvas?.dimensions?.distance) || 5;
+  return pointDistance(segment.start, segment.end) * (gridDistance / gridSize);
+}
+
+function tokenCenterPoint(tokenDoc) {
+  const objectCenter = tokenDoc?.object?.center;
+  if (objectCenter && Number.isFinite(Number(objectCenter.x)) && Number.isFinite(Number(objectCenter.y))) {
+    return { x: Number(objectCenter.x), y: Number(objectCenter.y) };
+  }
+  return movementPointToCenter(tokenDoc, tokenDoc);
+}
+
+function logicalMovementActor(document) {
+  const pair = getPairFromToken(document);
+  if (!pair || pairIsTearingDown(pair.state)) return { actor: document?.actor ?? null, pair: null };
+  if (document.uuid === pair.state.mountTokenUuid) return { actor: pair.riderToken?.actor ?? null, pair };
+  // Physical rider movement is either cancelled and rerouted to the mount, or is our internal follow-up sync.
+  if (document.uuid === pair.state.riderTokenUuid) return { actor: null, pair };
+  return { actor: document?.actor ?? null, pair: null };
+}
+
+export function recordMountedWeaponMovement(document, movement, operation, user) {
+  if (isInternal(operation)) return false;
+  if (user?.id && globalThis.game?.user?.id && user.id !== game.user.id) return false;
+  const turnKey = combatTurnKey(globalThis.game?.combat);
+  if (!turnKey) return false;
+
+  const { actor } = logicalMovementActor(document);
+  if (!actor?.uuid) return false;
+  const segment = movementStraightSegment(document, movement);
+  if (!segment) return false;
+
+  const previous = mountedWeaponMovementByActor.get(actor.uuid);
+  const merged = previous?.turnKey === turnKey
+    ? mergeStraightSegments(previous.segment, segment)
+    : segment;
+  mountedWeaponMovementByActor.set(actor.uuid, {
+    turnKey,
+    segment: merged,
+    distance: measureStraightSegmentDistance(merged, document?.parent)
+  });
+  return true;
+}
+
+function actionTypeForWorkflow(workflow) {
+  return workflow?.activity?.actionType ?? workflow?.item?.system?.actionType;
+}
+
+function hitTargetForWeaponWorkflow(workflow) {
+  const hits = [...(workflow?.hitTargets ?? [])].map(asTokenDocument).filter(Boolean);
+  return hits.length === 1 ? hits[0] : null;
+}
+
+function physicalRiderPairForWorkflow(workflow) {
+  const riderToken = asTokenDocument(workflow?.token);
+  if (!riderToken) return null;
+  const pair = getPairFromToken(riderToken);
+  if (!pair || pairIsTearingDown(pair.state) || riderToken.uuid !== pair.state.riderTokenUuid) return null;
+  return pair;
+}
+
+function chargeStateForWorkflow(workflow, target) {
+  const actorUuid = workflow?.actor?.uuid;
+  const turnKey = combatTurnKey(globalThis.game?.combat);
+  if (!actorUuid || !turnKey) return {
+    inCombat: false,
+    chargeUsed: false,
+    chargeDistance: 0,
+    movedTowardTarget: false,
+    turnKey: null
+  };
+  const movement = mountedWeaponMovementByActor.get(actorUuid);
+  const current = movement?.turnKey === turnKey ? movement : null;
+  const targetPoint = tokenCenterPoint(target);
+  return {
+    inCombat: true,
+    chargeUsed: mountedWeaponChargeUsedByActor.get(actorUuid) === turnKey,
+    chargeDistance: current?.distance ?? 0,
+    movedTowardTarget: Boolean(current?.segment && segmentMovesTowardTarget(current.segment, targetPoint)),
+    turnKey
+  };
+}
+
+export async function applyMountedWeaponDamage(workflow) {
+  if (!workflow || mountedWeaponProcessedWorkflows.has(workflow)) return false;
+  const profile = mountedWeaponProfile(workflow?.item?.name);
+  if (!profile || String(actionTypeForWorkflow(workflow) ?? "").toLowerCase() !== "mwak") return false;
+  const target = hitTargetForWeaponWorkflow(workflow);
+  if (!target) return false;
+
+  const pair = physicalRiderPairForWorkflow(workflow);
+  const charge = chargeStateForWorkflow(workflow, target);
+  const plan = planMountedWeaponDamage({
+    itemName: workflow.item.name,
+    actionType: actionTypeForWorkflow(workflow),
+    physicallyMounted: Boolean(pair),
+    mountSize: pair?.mountToken?.actor?.system?.traits?.size,
+    targetSize: target.actor?.system?.traits?.size,
+    ...charge
+  });
+  if (!plan.formula) return false;
+
+  const RollClass = globalThis.Roll;
+  if (typeof RollClass !== "function" || typeof workflow.setBonusDamageRolls !== "function") return false;
+  const labels = [];
+  if (plan.mountedBonus) labels.push("Верховой бой");
+  if (plan.chargeFormula) labels.push("Наскок");
+  const bonusRoll = new RollClass(plan.formula, workflow.actor?.getRollData?.() ?? {}, {
+    flavor: labels.join(" + ") || "Верховое оружие"
+  });
+  const existing = Array.isArray(workflow.bonusDamageRolls) ? [...workflow.bonusDamageRolls] : [];
+  await workflow.setBonusDamageRolls([...existing, bonusRoll]);
+  mountedWeaponProcessedWorkflows.add(workflow);
+
+  if (plan.consumeCharge && workflow.actor?.uuid && charge.turnKey) {
+    mountedWeaponChargeUsedByActor.set(workflow.actor.uuid, charge.turnKey);
+  }
+  return true;
+}
+
+function registerMountedWeaponHooks(hooks = globalThis.Hooks) {
+  if (!hooks?.on) return;
+  hooks.on("moveToken", (document, movement, operation, user) => {
+    recordMountedWeaponMovement(document, movement, operation, user);
+  });
+  hooks.on("midi-qol.DamageRollComplete", async workflow => {
+    try {
+      await applyMountedWeaponDamage(workflow);
+    } catch (err) {
+      error("Ошибка автоматизации свойств верхового оружия", err);
+    }
+  });
+}
+
+if (typeof globalThis.Hooks !== "undefined") registerMountedWeaponHooks();
+
 if (typeof globalThis.Hooks !== "undefined") Hooks.on("deleteToken", handleDeleteToken);
 
 async function cleanupBrokenPairState(state, mountToken, riderToken = null) {
