@@ -39,6 +39,18 @@ export function parseAllowedActorUuids(html = "") {
   return uuids;
 }
 
+function parseMountScale(section, key) {
+  const match = String(section).match(new RegExp(
+    `${key}\\s*:\\s*(?:"([^"]+)"|'([^']+)'|\`([^\`]+)\`|([^\\r\\n<]+))`,
+    "i"
+  ));
+  const raw = (match?.[1] ?? match?.[2] ?? match?.[3] ?? match?.[4] ?? "")
+    .replace(/&nbsp;/gi, " ")
+    .trim();
+  const value = Number(raw.replace(",", "."));
+  return Number.isFinite(value) && value > 0 ? value : 1;
+}
+
 export function parseMountDefinitions(html = "") {
   const source = String(html);
   const actorRegex = /@UUID\[(Actor\.[^\]]+)\]/g;
@@ -56,15 +68,21 @@ export function parseMountDefinitions(html = "") {
     const mountedTexture = (textureMatch?.[1] ?? textureMatch?.[2] ?? textureMatch?.[3] ?? textureMatch?.[4] ?? "")
       .replace(/&nbsp;/gi, " ")
       .trim() || null;
+    const mountScale = parseMountScale(section, "mountScale");
+    const mountedScale = parseMountScale(section, "mountedScale");
 
-    definitions.push({ actorUuid, mountedTexture });
+    definitions.push({ actorUuid, mountedTexture, mountScale, mountedScale });
   }
 
   return definitions;
 }
 
+export function mountDefinitionFromItemDescription(html, actorUuid) {
+  return parseMountDefinitions(html).find(definition => definition.actorUuid === actorUuid) ?? null;
+}
+
 export function mountedTextureFromItemDescription(html, actorUuid) {
-  return parseMountDefinitions(html).find(definition => definition.actorUuid === actorUuid)?.mountedTexture ?? null;
+  return mountDefinitionFromItemDescription(html, actorUuid)?.mountedTexture ?? null;
 }
 
 export function splitSharedHp({ sharedHp, mountHpBeforePool, riderMax, mountMax }) {
@@ -324,6 +342,34 @@ function mountedTransparentTexture() {
   return MOUNTED_COMBAT_CONFIG.transparentTexture;
 }
 
+function normalizedTokenScale(value) {
+  const scale = Number(value);
+  return Number.isFinite(scale) && scale > 0 ? scale : 1;
+}
+
+export function buildTransferredTokenPairResetUpdate({ pairState = null, riderLink = null } = {}) {
+  const update = {};
+
+  if (pairState?.pairId) {
+    const mountScale = normalizedTokenScale(pairState.mountScale);
+    if (pairState.visual?.mountTexture) update["texture.src"] = pairState.visual.mountTexture;
+    update["texture.scaleX"] = mountScale;
+    update["texture.scaleY"] = mountScale;
+    if (Number.isFinite(Number(pairState.visual?.mountSort))) update.sort = Number(pairState.visual.mountSort);
+    update[`flags.${MODULE_ID}.-=${PAIR_FLAG}`] = null;
+    if (riderLink?.pairId) update[`flags.${MODULE_ID}.-=${RIDER_LINK_FLAG}`] = null;
+    return update;
+  }
+
+  if (riderLink?.pairId) {
+    if (riderLink.riderTexture) update["texture.src"] = riderLink.riderTexture;
+    if (Number.isFinite(Number(riderLink.riderSort))) update.sort = Number(riderLink.riderSort);
+    update[`flags.${MODULE_ID}.-=${RIDER_LINK_FLAG}`] = null;
+  }
+
+  return update;
+}
+
 async function writePairState(mountToken, state) {
   await mountToken.update({
     [`flags.${MODULE_ID}.${PAIR_FLAG}`]: state
@@ -351,7 +397,7 @@ async function findPairItem(state, riderToken, passedItem = null) {
   return riderToken?.actor?.items?.find?.(item => isMountToggleItemName(item.name)) ?? null;
 }
 
-export async function mountPair(riderToken, mountToken, item, mountedTexture) {
+export async function mountPair(riderToken, mountToken, item, mountedTexture, mountScale = 1, mountedScale = 1) {
   const riderPos = riderMountedPosition(mountToken);
   const riderOriginalSort = Number(riderToken.sort) || 0;
   const mountOriginalSort = Number(mountToken.sort) || 0;
@@ -367,6 +413,8 @@ export async function mountPair(riderToken, mountToken, item, mountedTexture) {
     riderActorUuid: tokenBaseActorUuid(riderToken),
     mountActorUuid: tokenBaseActorUuid(mountToken),
     itemUuid: item?.uuid ?? null,
+    mountScale: normalizedTokenScale(mountScale),
+    mountedScale: normalizedTokenScale(mountedScale),
     poolActive: false,
     sharedHp: null,
     sharedTemp: null,
@@ -385,6 +433,8 @@ export async function mountPair(riderToken, mountToken, item, mountedTexture) {
 
   await mountToken.update({
     "texture.src": mountedTexture,
+    "texture.scaleX": state.mountedScale,
+    "texture.scaleY": state.mountedScale,
     [`flags.${MODULE_ID}.${PAIR_FLAG}`]: state
   }, internalOptions());
 
@@ -492,6 +542,8 @@ export async function dismountPair(riderToken, item = null) {
     await Promise.all([
       mountToken.update({
         "texture.src": finalState.visual?.mountTexture ?? mountToken.texture?.src,
+        "texture.scaleX": normalizedTokenScale(finalState.mountScale),
+        "texture.scaleY": normalizedTokenScale(finalState.mountScale),
         sort: finalState.visual?.mountSort ?? mountToken.sort
       }, internalOptions()),
       riderToken.update({
@@ -554,7 +606,8 @@ export async function toggleFromActivity(activity) {
   const targetActorUuid = tokenBaseActorUuid(mountToken);
   const itemDescription = getItemDescriptionHtml(item);
   const allowedActorUuids = parseAllowedActorUuids(itemDescription);
-  const mountedTexture = mountedTextureFromItemDescription(itemDescription, targetActorUuid);
+  const mountDefinition = mountDefinitionFromItemDescription(itemDescription, targetActorUuid);
+  const mountedTexture = mountDefinition?.mountedTexture ?? null;
   const validation = validateMountCandidate({
     targetCount: targetObjects.length,
     targetActorUuid,
@@ -571,7 +624,14 @@ export async function toggleFromActivity(activity) {
   });
   if (!validation.ok) return warn(validation.code);
 
-  await mountPair(riderToken, mountToken, item, mountedTexture);
+  await mountPair(
+    riderToken,
+    mountToken,
+    item,
+    mountedTexture,
+    mountDefinition?.mountScale ?? 1,
+    mountDefinition?.mountedScale ?? 1
+  );
   return true;
 }
 
@@ -2089,6 +2149,8 @@ export async function cleanupPairAfterTokenDeletion(deletedToken) {
     if (mountSurvives) {
       await pair.mountToken.update({
         "texture.src": state.visual?.mountTexture ?? pair.mountToken.texture?.src,
+        "texture.scaleX": normalizedTokenScale(state.mountScale),
+        "texture.scaleY": normalizedTokenScale(state.mountScale),
         sort: state.visual?.mountSort ?? pair.mountToken.sort,
         [`flags.${MODULE_ID}.-=${PAIR_FLAG}`]: null
       }, internalOptions());
@@ -2111,6 +2173,36 @@ export async function cleanupPairAfterTokenDeletion(deletedToken) {
     cancelPairRuntimeWork(pairId);
     tearingDownPairs.delete(pairId);
   }
+}
+
+function transferredPairMarkers(document) {
+  return {
+    pairState: document?.getFlag?.(MODULE_ID, PAIR_FLAG)
+      ?? document?.flags?.[MODULE_ID]?.[PAIR_FLAG]
+      ?? null,
+    riderLink: document?.getFlag?.(MODULE_ID, RIDER_LINK_FLAG)
+      ?? document?.flags?.[MODULE_ID]?.[RIDER_LINK_FLAG]
+      ?? null
+  };
+}
+
+function handlePreCreateToken(document) {
+  const { pairState, riderLink } = transferredPairMarkers(document);
+  const update = buildTransferredTokenPairResetUpdate({ pairState, riderLink });
+  if (!Object.keys(update).length) return;
+
+  document.updateSource?.(update);
+}
+
+function handleCreateToken(document, _options, userId) {
+  if (userId && globalThis.game?.user?.id && userId !== game.user.id) return;
+  const { pairState, riderLink } = transferredPairMarkers(document);
+  const update = buildTransferredTokenPairResetUpdate({ pairState, riderLink });
+  if (!Object.keys(update).length) return;
+
+  Promise.resolve()
+    .then(() => document.update(update, internalOptions()))
+    .catch(err => error("Ошибка очистки верховой пары при создании токена на сцене", err));
 }
 
 function handleDeleteToken(document, _options, userId) {
@@ -2423,7 +2515,11 @@ function registerMountedWeaponHooks(hooks = globalThis.Hooks) {
 
 if (typeof globalThis.Hooks !== "undefined") registerMountedWeaponHooks();
 
-if (typeof globalThis.Hooks !== "undefined") Hooks.on("deleteToken", handleDeleteToken);
+if (typeof globalThis.Hooks !== "undefined") {
+  Hooks.on("preCreateToken", handlePreCreateToken);
+  Hooks.on("createToken", handleCreateToken);
+  Hooks.on("deleteToken", handleDeleteToken);
+}
 
 async function cleanupBrokenPairState(state, mountToken, riderToken = null) {
   if (!state?.pairId || !mountToken) return false;
@@ -2445,6 +2541,8 @@ async function cleanupBrokenPairState(state, mountToken, riderToken = null) {
     }
     await mountToken.update({
       "texture.src": state.visual?.mountTexture ?? mountToken.texture?.src,
+      "texture.scaleX": normalizedTokenScale(state.mountScale),
+      "texture.scaleY": normalizedTokenScale(state.mountScale),
       sort: state.visual?.mountSort ?? mountToken.sort,
       [`flags.${MODULE_ID}.-=${PAIR_FLAG}`]: null
     }, internalOptions());
@@ -2495,6 +2593,10 @@ export async function repairMountedPairsOnCanvas() {
     }
 
     await renameToggleItem(toggleItem, true);
+    await mountToken.update({
+      "texture.scaleX": normalizedTokenScale(state.mountedScale),
+      "texture.scaleY": normalizedTokenScale(state.mountedScale)
+    }, internalOptions());
     await syncRiderToMount(pair);
     pair = getLivePairForMutation(pair);
     if (!pair) continue;
