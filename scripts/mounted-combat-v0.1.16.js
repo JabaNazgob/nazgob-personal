@@ -2217,19 +2217,28 @@ function handleDeleteToken(document, _options, userId) {
 // Mounted weapon properties: "Верховой бой" and "Наскок"
 // ---------------------------------------------------------------------------
 
-export const MOUNTED_WEAPON_CONFIG = Object.freeze([
-  Object.freeze({ prefix: "Молот всадника", mountedBonus: 2, charge: "2d2" }),
-  Object.freeze({ prefix: "Кавалерийская пика", mountedBonus: 2, charge: "3d2" })
-]);
-
 const mountedWeaponMovementByActor = new Map();
 const mountedWeaponChargeUsedByActor = new Map();
 const mountedWeaponProcessedWorkflows = new WeakSet();
 
-export function mountedWeaponProfile(itemName) {
-  const name = String(itemName ?? "");
-  const profile = MOUNTED_WEAPON_CONFIG.find(entry => name.startsWith(entry.prefix));
-  return profile ? { ...profile } : null;
+function itemHasSystemProperty(item, propertyId) {
+  const properties = item?.system?.properties;
+  if (typeof properties?.has === "function") return properties.has(propertyId);
+  if (Array.isArray(properties)) return properties.includes(propertyId);
+  return Boolean(properties?.[propertyId]);
+}
+
+function mountedWeaponChargeFormula(item) {
+  const raw = item?.flags?.["rebreya-main"]?.lichWeaponPropertyValues?.dashDice;
+  const formula = String(raw ?? "").trim();
+  return formula || null;
+}
+
+export function mountedWeaponProfile(item) {
+  if (!item || typeof item !== "object") return null;
+  const mountedBonus = itemHasSystemProperty(item, "lchMounted") ? 2 : 0;
+  const charge = mountedWeaponChargeFormula(item);
+  return mountedBonus || charge ? { mountedBonus, charge } : null;
 }
 
 export function shouldGrantMountedWeaponBonus({ physicallyMounted, mountSize, targetSize }) {
@@ -2316,7 +2325,7 @@ export function segmentMovesTowardTarget(segment, targetPoint) {
 }
 
 export function planMountedWeaponDamage({
-  itemName,
+  item,
   actionType,
   physicallyMounted,
   mountSize,
@@ -2326,7 +2335,7 @@ export function planMountedWeaponDamage({
   chargeDistance,
   movedTowardTarget
 }) {
-  const profile = mountedWeaponProfile(itemName);
+  const profile = mountedWeaponProfile(item);
   if (!profile || String(actionType ?? "").toLowerCase() !== "mwak") {
     return { formula: null, mountedBonus: 0, chargeFormula: null, consumeCharge: false };
   }
@@ -2464,7 +2473,7 @@ function chargeStateForWorkflow(workflow, target) {
 
 export async function applyMountedWeaponDamage(workflow) {
   if (!workflow || mountedWeaponProcessedWorkflows.has(workflow)) return false;
-  const profile = mountedWeaponProfile(workflow?.item?.name);
+  const profile = mountedWeaponProfile(workflow?.item);
   if (!profile || String(actionTypeForWorkflow(workflow) ?? "").toLowerCase() !== "mwak") return false;
   const target = hitTargetForWeaponWorkflow(workflow);
   if (!target) return false;
@@ -2472,7 +2481,7 @@ export async function applyMountedWeaponDamage(workflow) {
   const pair = physicalRiderPairForWorkflow(workflow);
   const charge = chargeStateForWorkflow(workflow, target);
   const plan = planMountedWeaponDamage({
-    itemName: workflow.item.name,
+    item: workflow.item,
     actionType: actionTypeForWorkflow(workflow),
     physicallyMounted: Boolean(pair),
     mountSize: pair?.mountToken?.actor?.system?.traits?.size,
