@@ -161,6 +161,39 @@ const RIDER_LINK_FLAG = "mountedRiderLink";
 // teardown is running, so use both a runtime barrier and a persisted marker.
 const tearingDownPairs = new Set();
 
+// A second click must not observe half-written flags, HP, or textures. Cover
+// both tokens and their Actors because linked token copies share HP/effects.
+const tokenTransitions = new Set();
+const pairOperations = new Map();
+
+function transitionKeys(tokens) {
+  return [...new Set(tokens.flatMap(token => [token?.uuid, token?.actor?.uuid]).filter(Boolean))];
+}
+
+function tokenTransitionBusy(token) {
+  return transitionKeys([token]).some(key => tokenTransitions.has(key));
+}
+
+async function withTokenTransition(tokens, operation) {
+  const keys = transitionKeys(tokens);
+  if (keys.some(key => tokenTransitions.has(key))) return false;
+  keys.forEach(key => tokenTransitions.add(key));
+  try { return await operation(); }
+  finally { keys.forEach(key => tokenTransitions.delete(key)); }
+}
+
+// HP/effect writes and teardown use the same queue. Teardown cannot remove an
+// effect while a previously dispatched rebuild is still writing that effect.
+async function withPairOperation(pair, operation) {
+  const pairId = pair?.state?.pairId;
+  if (!pairId) return null;
+  const previous = pairOperations.get(pairId) ?? Promise.resolve();
+  const pending = previous.catch(() => {}).then(operation);
+  pairOperations.set(pairId, pending);
+  try { return await pending; }
+  finally { if (pairOperations.get(pairId) === pending) pairOperations.delete(pairId); }
+}
+
 function pairIsTearingDown(stateOrPairId) {
   const pairId = typeof stateOrPairId === "string" ? stateOrPairId : stateOrPairId?.pairId;
   return Boolean(stateOrPairId?.tearingDown || (pairId && tearingDownPairs.has(pairId)));
@@ -398,6 +431,13 @@ async function findPairItem(state, riderToken, passedItem = null) {
 }
 
 export async function mountPair(riderToken, mountToken, item, mountedTexture, mountScale = 1, mountedScale = 1) {
+  return withTokenTransition([riderToken, mountToken], async () => {
+    if (getPairFromToken(riderToken) || getPairFromToken(mountToken)) return false;
+    return mountPairNow(riderToken, mountToken, item, mountedTexture, mountScale, mountedScale);
+  });
+}
+
+async function mountPairNow(riderToken, mountToken, item, mountedTexture, mountScale, mountedScale) {
   const riderPos = riderMountedPosition(mountToken);
   const riderOriginalSort = Number(riderToken.sort) || 0;
   const mountOriginalSort = Number(mountToken.sort) || 0;
@@ -448,7 +488,7 @@ export async function mountPair(riderToken, mountToken, item, mountedTexture, mo
       pairId,
       mountTokenUuid: mountToken.uuid,
       itemUuid: item?.uuid ?? null,
-      riderTexture: riderToken.texture?.src ?? null,
+      riderTexture: state.visual.riderTexture,
       riderSort: riderOriginalSort
     }
   }, internalOptions());
@@ -505,7 +545,14 @@ function cancelPairRuntimeWork(pairId) {
 
 export async function dismountPair(riderToken, item = null) {
   const pair = getPairFromToken(riderToken);
-  if (!pair?.state?.pairId || pairIsTearingDown(pair.state)) return false;
+  if (!pair?.state?.pairId) return false;
+  return withTokenTransition([riderToken, pair.mountToken], () =>
+    withPairOperation(pair, () => dismountPairNow(riderToken, item, pair.state.pairId)));
+}
+
+async function dismountPairNow(riderToken, item, expectedPairId) {
+  const pair = getPairFromToken(riderToken);
+  if (pair?.state?.pairId !== expectedPairId || pairIsTearingDown(pair.state)) return false;
   const { state, mountToken } = pair;
   const pairId = state.pairId;
   const dismountPosition = (typeof findDismountPosition === "function")
@@ -524,7 +571,7 @@ export async function dismountPair(riderToken, item = null) {
     workingPair = getPairFromToken(mountToken) ?? workingPair;
 
     if (workingPair.state.poolActive && typeof deactivatePool === "function") {
-      await deactivatePool(workingPair, { allowTeardown: true });
+      await deactivatePoolNow(workingPair, { allowTeardown: true });
       workingPair = getPairFromToken(mountToken) ?? workingPair;
     }
 
@@ -532,26 +579,22 @@ export async function dismountPair(riderToken, item = null) {
     const finalState = workingPair.state;
     const toggleItem = await findPairItem(finalState, riderToken, item);
 
-    // Relationship first, cosmetics second. Once both flags are gone, stale
-    // callbacks cannot rediscover or resurrect this pair.
-    await Promise.all([
-      clearTokenPairFlags(mountToken, { pair: true }),
-      clearTokenPairFlags(riderToken, { link: true })
-    ]);
-
+    // Restore appearance and remove the relationship in the same token write.
     await Promise.all([
       mountToken.update({
         "texture.src": finalState.visual?.mountTexture ?? mountToken.texture?.src,
         "texture.scaleX": normalizedTokenScale(finalState.mountScale),
         "texture.scaleY": normalizedTokenScale(finalState.mountScale),
-        sort: finalState.visual?.mountSort ?? mountToken.sort
+        sort: finalState.visual?.mountSort ?? mountToken.sort,
+        [`flags.${MODULE_ID}.-=${PAIR_FLAG}`]: null
       }, internalOptions()),
       riderToken.update({
         x: dismountPosition.x,
         y: dismountPosition.y,
         elevation: dismountPosition.elevation,
         sort: finalState.visual?.riderSort ?? riderToken.sort,
-        "texture.src": finalState.visual?.riderTexture ?? riderToken.texture?.src
+        "texture.src": finalState.visual?.riderTexture ?? riderToken.texture?.src,
+        [`flags.${MODULE_ID}.-=${RIDER_LINK_FLAG}`]: null
       }, internalOptions())
     ]);
 
@@ -586,6 +629,7 @@ export async function toggleFromActivity(activity) {
   if (!item || !isMountToggleItemName(item.name)) return false;
   const riderToken = resolveRiderTokenDocument(activity);
   if (!riderToken) return warn("rider-token");
+  if (tokenTransitionBusy(riderToken)) return false;
 
   const existingPair = getPairFromToken(riderToken);
   if (existingPair || item.name === MOUNTED_COMBAT_CONFIG.dismountItemName) {
@@ -624,15 +668,14 @@ export async function toggleFromActivity(activity) {
   });
   if (!validation.ok) return warn(validation.code);
 
-  await mountPair(
+  return Boolean(await mountPair(
     riderToken,
     mountToken,
     item,
     mountedTexture,
     mountDefinition?.mountScale ?? 1,
     mountDefinition?.mountedScale ?? 1
-  );
-  return true;
+  ));
 }
 
 function onPreUseActivity(activity) {
@@ -1246,6 +1289,10 @@ async function setActorsSharedValues(pair, { value, temp }) {
 }
 
 export async function rebuildPoolEffects(pair) {
+  return withPairOperation(pair, () => rebuildPoolEffectsNow(pair));
+}
+
+async function rebuildPoolEffectsNow(pair) {
   let fresh = getLivePairForMutation(pair);
   if (!fresh?.state?.poolActive) return fresh;
   const { rider, mount } = pairActors(fresh);
@@ -1275,6 +1322,10 @@ export async function rebuildPoolEffects(pair) {
 }
 
 export async function activatePool(pair) {
+  return withPairOperation(pair, () => activatePoolNow(pair));
+}
+
+async function activatePoolNow(pair) {
   let fresh = getLivePairForMutation(pair);
   if (!fresh || fresh.state.poolActive || runtimeRiderIncapacitated(fresh)) return fresh;
   const { rider, mount } = pairActors(fresh);
@@ -1316,6 +1367,10 @@ export async function activatePool(pair) {
 }
 
 export async function deactivatePool(pair, { allowTeardown = false } = {}) {
+  return withPairOperation(pair, () => deactivatePoolNow(pair, { allowTeardown }));
+}
+
+async function deactivatePoolNow(pair, { allowTeardown = false } = {}) {
   let fresh = allowTeardown ? (getPairFromToken(pair?.mountToken) ?? pair) : getLivePairForMutation(pair);
   if (!fresh?.state?.poolActive) return fresh;
   if (!allowTeardown && pairIsTearingDown(fresh.state)) return fresh;
@@ -1358,11 +1413,15 @@ export async function deactivatePool(pair, { allowTeardown = false } = {}) {
 }
 
 export async function refreshCapability(pair) {
+  return withPairOperation(pair, () => refreshCapabilityNow(pair));
+}
+
+async function refreshCapabilityNow(pair) {
   const fresh = getLivePairForMutation(pair);
   if (!fresh) return null;
   const incapacitated = runtimeRiderIncapacitated(fresh);
-  if (fresh.state.poolActive && incapacitated) return deactivatePool(fresh);
-  if (!fresh.state.poolActive && !incapacitated) return activatePool(fresh);
+  if (fresh.state.poolActive && incapacitated) return deactivatePoolNow(fresh);
+  if (!fresh.state.poolActive && !incapacitated) return activatePoolNow(fresh);
   return fresh;
 }
 
@@ -1408,32 +1467,36 @@ export async function syncPoolFromActorUpdate(actor, changes, options) {
     || changeContainsPath(changes, "system.attributes.hp.tempmax");
   if (!valueChanged && !tempChanged && !maxChanged) return;
 
-  for (let pair of physicalPairsForActor(actor)) {
-    if (pairSuppressedByMidi(pair.state.pairId)) continue;
-    if (!pair.state.poolActive) {
-      await refreshCapability(pair);
-      continue;
-    }
+  const hp = actorHpData(actor);
+  for (const candidate of physicalPairsForActor(actor)) {
+    await withPairOperation(candidate, async () => {
+      let pair = getLivePairForMutation(candidate);
+      if (!pair || pairSuppressedByMidi(pair.state.pairId)) return;
+      if (!pair.state.poolActive) {
+        await refreshCapabilityNow(pair);
+        return;
+      }
 
-    const hp = actorHpData(actor);
-    const nextState = {
-      ...pair.state,
-      sharedHp: valueChanged ? hp.value : pair.state.sharedHp,
-      sharedTemp: tempChanged ? hp.temp : pair.state.sharedTemp
-    };
-    if (pairIsTearingDown(nextState)) continue;
-    await writePairState(pair.mountToken, nextState);
-    pair = getLivePairForMutation({ ...pair, state: nextState });
-    if (!pair) continue;
+      const nextState = {
+        ...pair.state,
+        sharedHp: valueChanged ? hp.value : pair.state.sharedHp,
+        sharedTemp: tempChanged ? hp.temp : pair.state.sharedTemp
+      };
+      if (pairIsTearingDown(nextState)) return;
+      await writePairState(pair.mountToken, nextState);
+      pair = getLivePairForMutation({ ...pair, state: nextState });
+      if (!pair) return;
 
-    const partner = actor === pair.riderToken?.actor ? pair.mountToken?.actor : pair.riderToken?.actor;
-    await setActorHp(partner, {
-      value: valueChanged ? nextState.sharedHp : undefined,
-      temp: tempChanged ? nextState.sharedTemp : undefined
+      // An earlier queued rebuild may have overwritten the source Actor while
+      // this external update waited. Apply the captured change to both halves.
+      await setActorsSharedValues(pair, {
+        value: valueChanged ? nextState.sharedHp : undefined,
+        temp: tempChanged ? nextState.sharedTemp : undefined
+      });
+
+      if (maxChanged) pair = await rebuildPoolEffectsNow(pair);
+      await refreshCapabilityNow(pair);
     });
-
-    if (maxChanged) pair = await rebuildPoolEffects(pair);
-    await refreshCapability(pair);
   }
 }
 
@@ -2031,38 +2094,45 @@ export async function reconcileMidiWorkflow(workflow) {
   const key = midiWorkflowKey(workflow);
   const context = midiWorkflowContexts.get(key);
   if (!context) return false;
+  if (context.reconciliation) return context.reconciliation;
+  context.reconciliation = Promise.resolve().then(() => reconcileMidiContext(workflow, context));
+  return context.reconciliation;
+}
 
+async function reconcileMidiContext(workflow, context) {
   const processed = [];
   try {
     for (const pairContext of context.pairs.values()) {
       const mountToken = resolveUuidSync(pairContext.mountTokenUuid) ?? await resolveUuid(pairContext.mountTokenUuid);
       const candidate = mountToken ? { state: mountToken.getFlag?.(MODULE_ID, PAIR_FLAG), mountToken } : null;
-      let pair = getLivePairForMutation(candidate);
-      if (!pair?.state?.poolActive || pair.state.pairId !== pairContext.pairId) continue;
+      await withPairOperation(candidate, async () => {
+        let pair = getLivePairForMutation(candidate);
+        if (!pair?.state?.poolActive || pair.state.pairId !== pairContext.pairId) return;
 
-      const { riderMax, mountMax } = currentIndependentMaxes(pair);
-      const afterMax = riderMax + mountMax;
-      const result = aggregatePoolWorkflowChanges({
-        beforeHp: pairContext.beforeHp,
-        beforeTemp: pairContext.beforeTemp,
-        afterMax,
-        isArea: context.isArea,
-        entries: [...pairContext.targets.values()]
+        const { riderMax, mountMax } = currentIndependentMaxes(pair);
+        const afterMax = riderMax + mountMax;
+        const result = aggregatePoolWorkflowChanges({
+          beforeHp: pairContext.beforeHp,
+          beforeTemp: pairContext.beforeTemp,
+          afterMax,
+          isArea: context.isArea,
+          entries: [...pairContext.targets.values()]
+        });
+
+        const nextState = {
+          ...pair.state,
+          sharedHp: result.sharedHp,
+          sharedTemp: result.sharedTemp,
+          sharedMax: afterMax
+        };
+        if (pairIsTearingDown(nextState)) return;
+        await writePairState(pair.mountToken, nextState);
+        pair = getLivePairForMutation({ ...pair, state: nextState });
+        if (!pair) return;
+        pair = await rebuildPoolEffectsNow(pair);
+        if (!pair) return;
+        processed.push({ pairId: pairContext.pairId, mountTokenUuid: pairContext.mountTokenUuid });
       });
-
-      const nextState = {
-        ...pair.state,
-        sharedHp: result.sharedHp,
-        sharedTemp: result.sharedTemp,
-        sharedMax: afterMax
-      };
-      if (pairIsTearingDown(nextState)) continue;
-      await writePairState(pair.mountToken, nextState);
-      pair = getLivePairForMutation({ ...pair, state: nextState });
-      if (!pair) continue;
-      pair = await rebuildPoolEffects(pair);
-      if (!pair) continue;
-      processed.push({ pairId: pairContext.pairId, mountTokenUuid: pairContext.mountTokenUuid });
     }
   } finally {
     releaseMidiWorkflowSuppression(workflow);

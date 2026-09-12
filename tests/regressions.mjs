@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import * as mod from '../scripts/mounted-combat-v0.1.17.js';
+import * as mod from '../scripts/mounted-combat-v0.1.18.js';
 function fixture({ duplicate = false, stale = false } = {}) {
   const docs = new Map();
   globalThis.fromUuidSync = uuid => docs.get(uuid);
