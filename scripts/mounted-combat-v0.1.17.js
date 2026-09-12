@@ -1154,23 +1154,49 @@ function currentIndependentMaxes(pair) {
     riderMax: independentMaxFromHp({
       max: riderHp.max,
       tempmax: riderHp.tempmax,
-      moduleBonus: pair.state.riderMaxBonus
+      moduleBonus: appliedSharedMaxBonus(rider)
     }),
     mountMax: independentMaxFromHp({
       max: mountHp.max,
       tempmax: mountHp.tempmax,
-      moduleBonus: pair.state.mountMaxBonus
+      moduleBonus: appliedSharedMaxBonus(mount)
     })
   };
+}
+
+// Read the effects actually included in prepared HP, not a saved value which
+// can lag behind an asynchronous effect update. Include old/duplicate effects.
+function appliedSharedMaxBonus(actor) {
+  return [...(actor?.effects ?? [])].reduce((total, effect) => {
+    if (!effect.getFlag?.(MODULE_ID, MAX_EFFECT_FLAG) || effect.disabled || effect.isSuppressed) return total;
+    return total + (effect.changes ?? []).reduce((sum, change) =>
+      change.key === "system.attributes.hp.tempmax" && Number(change.mode) === 2
+        ? sum + (Number(change.value) || 0) : sum, 0);
+  }, 0);
 }
 
 function findSharedMaxEffect(actor, pairId) {
   return actor?.effects?.find?.(effect => effect.getFlag?.(MODULE_ID, MAX_EFFECT_FLAG) === pairId) ?? null;
 }
 
+const sharedMaxEffectWrites = new WeakMap();
+
 async function ensureSharedMaxEffect(actor, pairId, bonus, origin = null) {
   if (!actor) return;
+  const previous = sharedMaxEffectWrites.get(actor) ?? Promise.resolve();
+  const pending = previous.catch(() => {}).then(() => writeSharedMaxEffect(actor, pairId, bonus, origin));
+  sharedMaxEffectWrites.set(actor, pending);
+  try { await pending; }
+  finally { if (sharedMaxEffectWrites.get(actor) === pending) sharedMaxEffectWrites.delete(actor); }
+}
+
+async function writeSharedMaxEffect(actor, pairId, bonus, origin = null) {
+  if (!actor) return;
   const existing = findSharedMaxEffect(actor, pairId);
+  const duplicates = [...(actor.effects ?? [])]
+    .filter(effect => effect !== existing && effect.getFlag?.(MODULE_ID, MAX_EFFECT_FLAG))
+    .map(effect => effect.id);
+  if (duplicates.length) await actor.deleteEmbeddedDocuments("ActiveEffect", duplicates, internalOptions());
   const data = {
     name: MAX_EFFECT_NAME,
     disabled: false,
@@ -1256,8 +1282,8 @@ export async function activatePool(pair) {
 
   const riderHp = actorHpData(rider);
   const mountHp = actorHpData(mount);
-  const riderMax = independentMaxFromHp({ max: riderHp.max, tempmax: riderHp.tempmax, moduleBonus: 0 });
-  const mountMax = independentMaxFromHp({ max: mountHp.max, tempmax: mountHp.tempmax, moduleBonus: 0 });
+  const riderMax = independentMaxFromHp({ max: riderHp.max, tempmax: riderHp.tempmax, moduleBonus: appliedSharedMaxBonus(rider) });
+  const mountMax = independentMaxFromHp({ max: mountHp.max, tempmax: mountHp.tempmax, moduleBonus: appliedSharedMaxBonus(mount) });
   const combined = combineSharedPool({
     riderHp: riderHp.value,
     mountHp: mountHp.value,
@@ -1945,8 +1971,11 @@ function getOrCreateMidiContext(workflow) {
 
 export function captureMidiTargetDamage(token, { workflow, damageItem } = {}) {
   const tokenDoc = asTokenDocument(token);
-  const pair = getPairFromToken(tokenDoc);
+  const pair = getLivePairForMutation(getPairFromToken(tokenDoc));
   if (!pair?.state?.poolActive || pairIsTearingDown(pair.state) || !workflow || !damageItem) return false;
+  // Midi also calculates damage-card entries for misses. They are previews,
+  // not applied damage, and must never be replayed into the shared pool.
+  if (damageItem.wasHit === false || damageItem.isHit === false) return false;
 
   const context = getOrCreateMidiContext(workflow);
   let pairContext = context.pairs.get(pair.state.pairId);
@@ -2101,10 +2130,10 @@ async function emergencySplitPool(pair) {
   const riderHp = actorHpData(rider);
   const mountHp = actorHpData(mount);
   const riderMax = rider
-    ? independentMaxFromHp({ max: riderHp.max, tempmax: riderHp.tempmax, moduleBonus: pair.state.riderMaxBonus })
+    ? independentMaxFromHp({ max: riderHp.max, tempmax: riderHp.tempmax, moduleBonus: appliedSharedMaxBonus(rider) })
     : Math.max(0, Number(pair.state.mountMaxBonus) || 0);
   const mountMax = mount
-    ? independentMaxFromHp({ max: mountHp.max, tempmax: mountHp.tempmax, moduleBonus: pair.state.mountMaxBonus })
+    ? independentMaxFromHp({ max: mountHp.max, tempmax: mountHp.tempmax, moduleBonus: appliedSharedMaxBonus(mount) })
     : Math.max(0, Number(pair.state.riderMaxBonus) || 0);
   const hpSplit = splitSharedHp({
     sharedHp: pair.state.sharedHp,
