@@ -1,8 +1,8 @@
 {
   "id": "nazgob-personal",
   "title": "Nazgob Personal",
-  "description": "Личные автоматизации Foundry VTT: верховой бой, верховое оружие, Медальон затягивающихся ран и связанные механики.",
-  "version": "0.1.18",
+  "description": "Личные автоматизации Foundry VTT: «Одно целое» (общие хиты наездника и скакуна), верховое оружие, Медальон затягивающихся ран, анимации огнестрела. Каждую функцию можно выключить в настройках.",
+  "version": "0.2.0",
   "authors": [
     {
       "name": "Nazgob"
@@ -29,9 +29,21 @@
         "id": "midi-qol",
         "type": "module"
       }
+    ],
+    "recommends": [
+      {
+        "id": "sequencer",
+        "type": "module",
+        "reason": "Анимации огнестрела"
+      },
+      {
+        "id": "psfx",
+        "type": "module",
+        "reason": "Звук выстрела"
+      }
     ]
   },
   "esmodules": [
-    "scripts/mounted-combat-v0.1.18.js"
+    "scripts/main-v0.2.0.js"
   ]
 }
